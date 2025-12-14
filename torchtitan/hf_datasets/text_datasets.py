@@ -20,6 +20,9 @@ from torchtitan.config import JobConfig
 from torchtitan.hf_datasets import DatasetConfig
 from torchtitan.tools.logging import logger
 
+# Standard PyTorch ignore index for CrossEntropyLoss
+IGNORE_INDEX = -100
+
 
 def _load_c4_dataset(dataset_path: str, split: str):
     """Load C4 dataset with default configuration."""
@@ -29,6 +32,86 @@ def _load_c4_dataset(dataset_path: str, split: str):
 def _process_c4_text(sample: dict[str, Any]) -> str:
     """Process C4 dataset sample text."""
     return sample["text"]
+
+
+def _load_chat_jsonl_dataset(dataset_path: str):
+    """Load a JSONL dataset with chat messages format."""
+    return load_dataset("json", data_files=dataset_path, split="train")
+
+
+def _process_chat_jsonl_text(sample: dict[str, Any]) -> str:
+    """
+    Process chat JSONL dataset sample (legacy, for backward compatibility).
+    Expected format: {"messages": [{"role": "system/user/assistant", "content": "..."}, ...]}
+    Converts to a text format suitable for training.
+    """
+    messages = sample.get("messages", [])
+    if not messages:
+        return ""
+    
+    # Convert chat messages to a training-friendly format
+    # Format: <|role|>content<|end|>...
+    text_parts = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        text_parts.append(f"<|{role}|>\n{content}")
+    
+    return "\n".join(text_parts)
+
+
+def process_chat_sft(
+    sample: dict[str, Any],
+    tokenizer: BaseTokenizer,
+    assistant_role: str = "assistant",
+) -> tuple[list[int], list[int]]:
+    """
+    Process chat JSONL for SFT training.
+    Only computes loss on assistant responses (similar to fireworks SFT).
+    
+    Args:
+        sample: Dict with "messages" list containing role/content pairs
+        tokenizer: Tokenizer to encode text
+        assistant_role: Role name for assistant messages (default: "assistant")
+    
+    Returns:
+        (tokens, labels) where labels has IGNORE_INDEX for non-assistant tokens
+    """
+    messages = sample.get("messages", [])
+    if not messages:
+        return [], []
+    
+    all_tokens = []
+    all_labels = []
+    
+    for i, msg in enumerate(messages):
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        
+        # Format each message with role markers
+        if i == 0:
+            # First message gets BOS
+            msg_text = f"<|{role}|>\n{content}"
+            msg_tokens = tokenizer.encode(msg_text, add_bos=True, add_eos=False)
+        elif i == len(messages) - 1:
+            # Last message gets EOS
+            msg_text = f"<|{role}|>\n{content}"
+            msg_tokens = tokenizer.encode(msg_text, add_bos=False, add_eos=True)
+        else:
+            msg_text = f"<|{role}|>\n{content}"
+            msg_tokens = tokenizer.encode(msg_text, add_bos=False, add_eos=False)
+        
+        all_tokens.extend(msg_tokens)
+        
+        # Only compute loss on assistant responses
+        if role == assistant_role:
+            # For assistant messages, use actual tokens as labels
+            all_labels.extend(msg_tokens)
+        else:
+            # For system/user messages, mask out (ignore in loss)
+            all_labels.extend([IGNORE_INDEX] * len(msg_tokens))
+    
+    return all_tokens, all_labels
 
 
 # Add your dataset here - more information at docs/datasets.md
@@ -47,6 +130,11 @@ DATASETS = {
         path="allenai/c4",
         loader=partial(_load_c4_dataset, split="validation"),
         sample_processor=_process_c4_text,
+    ),
+    "chat_jsonl": DatasetConfig(
+        path="",  # Will be provided via dataset_path
+        loader=_load_chat_jsonl_dataset,
+        sample_processor=_process_chat_jsonl_text,
     ),
 }
 
@@ -96,6 +184,7 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
         # Variables for checkpointing
         self._sample_idx = 0
         self._token_buffer: list[int] = []
+        self._label_buffer: list[int] = []  # For SFT with masked labels
 
     def _get_data_iter(self):
         # For map-style datasets, resume by skipping to the correct index
@@ -113,21 +202,40 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
 
         while True:
             for sample in self._get_data_iter():
-                # Use the dataset-specific text processor
-                sample_text = self._text_processor(sample)
-                sample_tokens = self._tokenizer.encode(
-                    sample_text, add_bos=True, add_eos=True
-                )
-                self._token_buffer.extend(sample_tokens)
+                # Check if this is a chat format for SFT
+                is_chat_sft = self.dataset_name == "chat_jsonl" and "messages" in sample
+                
+                if is_chat_sft:
+                    # Use SFT processing with masked labels
+                    sample_tokens, sample_labels = process_chat_sft(
+                        sample, self._tokenizer, assistant_role="assistant"
+                    )
+                    self._token_buffer.extend(sample_tokens)
+                    self._label_buffer.extend(sample_labels)
+                else:
+                    # Standard text processing (all tokens get loss)
+                    sample_text = self._text_processor(sample)
+                    sample_tokens = self._tokenizer.encode(
+                        sample_text, add_bos=True, add_eos=True
+                    )
+                    self._token_buffer.extend(sample_tokens)
+                    self._label_buffer.extend(sample_tokens)
+                
                 self._sample_idx += 1
 
                 while len(self._token_buffer) >= max_buffer_token_len:
-                    x = torch.LongTensor(self._token_buffer[:max_buffer_token_len])
-                    # update tokens to the remaining tokens
+                    tokens = torch.LongTensor(self._token_buffer[:max_buffer_token_len])
+                    labels = torch.LongTensor(self._label_buffer[:max_buffer_token_len])
+                    
+                    # update buffers to remaining tokens
                     self._token_buffer = self._token_buffer[max_buffer_token_len:]
-                    input = x[:-1]
-                    label = x[1:]
-                    yield {"input": input}, label
+                    self._label_buffer = self._label_buffer[max_buffer_token_len:]
+                    
+                    # input is tokens[:-1], label is labels[1:] (shifted by 1 for next-token prediction)
+                    input_ids = tokens[:-1]
+                    target_labels = labels[1:]
+                    
+                    yield {"input": input_ids}, target_labels
 
             if not self.infinite:
                 logger.warning(f"Dataset {self.dataset_name} has run out of data")
@@ -145,6 +253,7 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
 
     def load_state_dict(self, state_dict):
         self._token_buffer = state_dict["token_buffer"]
+        self._label_buffer = state_dict.get("label_buffer", [])
 
         if isinstance(self._data, Dataset):
             self._sample_idx = state_dict["sample_idx"]
@@ -153,7 +262,10 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
             self._data.load_state_dict(state_dict["data"])
 
     def state_dict(self):
-        _state_dict: dict[str, Any] = {"token_buffer": self._token_buffer}
+        _state_dict: dict[str, Any] = {
+            "token_buffer": self._token_buffer,
+            "label_buffer": self._label_buffer,
+        }
 
         if isinstance(self._data, Dataset):
             _state_dict["sample_idx"] = self._sample_idx
