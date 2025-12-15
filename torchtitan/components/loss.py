@@ -16,10 +16,17 @@ from torchtitan.tools.logging import logger
 LossFunction: TypeAlias = Callable[..., torch.Tensor]
 
 
+IGNORE_INDEX = -100 # for sft masking
+
+
 def cross_entropy_loss(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """Common cross-entropy loss function for Transformer models training."""
+    """Common cross-entropy loss function for Transformer models training.
+    
+    Supports label masking: labels with value IGNORE_INDEX (-100) are ignored.
+    This is useful for SFT where we only want to compute loss on assistant responses.
+    """
     return torch.nn.functional.cross_entropy(
-        pred.flatten(0, 1).float(), labels.flatten(0, 1)
+        pred.flatten(0, 1).float(), labels.flatten(0, 1), ignore_index=IGNORE_INDEX
     )
 
 
