@@ -409,6 +409,9 @@ class MetricsProcessor:
         tps = self.ntokens_since_last_log / (
             time_delta * self.parallel_dims.non_data_parallel_size
         )
+        # global tokens per second (total throughput across all devices)
+        global_tps = tps * self.parallel_dims.world_size
+        
         # model FLOPS utilization
         # For its definition and calculation, please refer to the PaLM paper:
         # https://arxiv.org/abs/2204.02311
@@ -426,6 +429,7 @@ class MetricsProcessor:
             "loss_metrics/global_max_loss": global_max_loss,
             "grad_norm": grad_norm,
             "throughput(tps)": tps,
+            "throughput(global_tps)": global_tps,
             "tflops": tflops,
             "mfu(%)": mfu,
             "time_metrics/end_to_end(s)": time_end_to_end,
@@ -452,6 +456,7 @@ class MetricsProcessor:
             f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
             f"({device_mem_stats.max_reserved_pct:.2f}%)  "
             f"{color.blue}tps: {round(tps):,}  "
+            f"{color.yellow}global_tps: {round(global_tps):,}  "
             f"{color.cyan}tflops: {tflops:,.2f}  "
             f"{color.magenta}mfu: {mfu:.2f}%{color.reset}"
         )

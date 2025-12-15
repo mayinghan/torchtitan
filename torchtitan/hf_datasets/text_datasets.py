@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from functools import partial
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -22,6 +22,9 @@ from torchtitan.tools.logging import logger
 
 # Standard PyTorch ignore index for CrossEntropyLoss
 IGNORE_INDEX = -100
+
+# Cache for AutoTokenizer (for apply_chat_template support)
+_auto_tokenizer_cache: dict[str, Any] = {}
 
 
 def _load_c4_dataset(dataset_path: str, split: str):
@@ -60,18 +63,119 @@ def _process_chat_jsonl_text(sample: dict[str, Any]) -> str:
     return "\n".join(text_parts)
 
 
+def _get_auto_tokenizer(tokenizer_path: str) -> Optional[Any]:
+    """
+    Get or create an AutoTokenizer from the given path.
+    Uses caching to avoid loading the same tokenizer multiple times.
+    """
+    global _auto_tokenizer_cache
+    
+    if tokenizer_path in _auto_tokenizer_cache:
+        return _auto_tokenizer_cache[tokenizer_path]
+    
+    try:
+        from transformers import AutoTokenizer
+        auto_tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+        _auto_tokenizer_cache[tokenizer_path] = auto_tokenizer
+        logger.info(f"Loaded AutoTokenizer from {tokenizer_path} for apply_chat_template support")
+        return auto_tokenizer
+    except Exception as e:
+        logger.warning(f"Failed to load AutoTokenizer from {tokenizer_path}: {e}")
+        _auto_tokenizer_cache[tokenizer_path] = None
+        return None
+
+
+def _get_completion_ranges(
+    messages: list[dict[str, Any]],
+    auto_tokenizer,
+    assistant_role: str = "assistant",
+) -> list[tuple[int, int]]:
+    """
+    Get the token ranges for all assistant messages using apply_chat_template.
+    Similar to fireworks' _get_completion_range but handles multiple assistant turns.
+    
+    Args:
+        messages: List of message dicts with 'role' and 'content' keys
+        auto_tokenizer: HuggingFace AutoTokenizer with apply_chat_template support
+        assistant_role: Role to treat as assistant (default: "assistant")
+    
+    Returns:
+        List of (start, end) tuples for each assistant message's token range.
+    """
+    ranges = []
+    
+    for i in range(len(messages)):
+        if messages[i].get("role") == assistant_role:
+            # Get tokens up to before this assistant message (the prompt)
+            prompt_messages = messages[:i]
+            # Get tokens including this assistant message
+            full_messages = messages[:i+1]
+            
+            if prompt_messages:
+                prompt_text = auto_tokenizer.apply_chat_template(
+                    prompt_messages, 
+                    tokenize=False, 
+                    add_generation_prompt=True
+                )
+                prompt_tokens = auto_tokenizer.encode(prompt_text, add_special_tokens=False)
+            else:
+                prompt_tokens = []
+            
+            full_text = auto_tokenizer.apply_chat_template(
+                full_messages, 
+                tokenize=False, 
+                add_generation_prompt=False
+            )
+            full_tokens = auto_tokenizer.encode(full_text, add_special_tokens=False)
+            
+            # The assistant message tokens are from prompt_len to full_len
+            start = len(prompt_tokens)
+            end = len(full_tokens)
+            if start < end:
+                ranges.append((start, end))
+    
+    return ranges
+
+
+def _mask_ranges(tokens: list[int], ranges: list[tuple[int, int]], mask: int = IGNORE_INDEX) -> list[int]:
+    """
+    Mask tokens outside the given ranges.
+    Similar to fireworks' mask_ranges function.
+    
+    Args:
+        tokens: List of token ids
+        ranges: List of (start, end) tuples indicating which tokens to keep unmasked
+        mask: Value to use for masked tokens (default: IGNORE_INDEX)
+    
+    Returns:
+        List of labels with masked tokens set to mask value
+    """
+    labels = []
+    for i, token in enumerate(tokens):
+        if any(start <= i < end for start, end in ranges):
+            labels.append(token)
+        else:
+            labels.append(mask)
+    return labels
+
+
 def process_chat_sft(
     sample: dict[str, Any],
     tokenizer: BaseTokenizer,
+    tokenizer_path: str,
     assistant_role: str = "assistant",
 ) -> tuple[list[int], list[int]]:
     """
-    Process chat JSONL for SFT training.
+    Process chat JSONL for SFT training using apply_chat_template.
     Only computes loss on assistant responses (similar to fireworks SFT).
+    
+    Uses tokenizer.apply_chat_template via AutoTokenizer if available for proper formatting,
+    otherwise falls back to simple role markers.
     
     Args:
         sample: Dict with "messages" list containing role/content pairs
-        tokenizer: Tokenizer to encode text
+        tokenizer: torchtitan BaseTokenizer for encoding
+        tokenizer_path: Path to tokenizer (for loading AutoTokenizer)
         assistant_role: Role name for assistant messages (default: "assistant")
     
     Returns:
@@ -81,37 +185,27 @@ def process_chat_sft(
     if not messages:
         return [], []
     
-    all_tokens = []
-    all_labels = []
+    # Try to get AutoTokenizer for apply_chat_template
+    auto_tokenizer = _get_auto_tokenizer(tokenizer_path)
     
-    for i, msg in enumerate(messages):
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
+    if auto_tokenizer is not None:
+        # Use AutoTokenizer's apply_chat_template for proper formatting
+        full_text = auto_tokenizer.apply_chat_template(
+            messages, 
+            tokenize=False, 
+            add_generation_prompt=False
+        )
+        tokens = auto_tokenizer.encode(full_text, add_special_tokens=True)
         
-        # Format each message with role markers
-        if i == 0:
-            # First message gets BOS
-            msg_text = f"<|{role}|>\n{content}"
-            msg_tokens = tokenizer.encode(msg_text, add_bos=True, add_eos=False)
-        elif i == len(messages) - 1:
-            # Last message gets EOS
-            msg_text = f"<|{role}|>\n{content}"
-            msg_tokens = tokenizer.encode(msg_text, add_bos=False, add_eos=True)
-        else:
-            msg_text = f"<|{role}|>\n{content}"
-            msg_tokens = tokenizer.encode(msg_text, add_bos=False, add_eos=False)
-        
-        all_tokens.extend(msg_tokens)
-        
-        # Only compute loss on assistant responses
-        if role == assistant_role:
-            # For assistant messages, use actual tokens as labels
-            all_labels.extend(msg_tokens)
-        else:
-            # For system/user messages, mask out (ignore in loss)
-            all_labels.extend([IGNORE_INDEX] * len(msg_tokens))
+        # Get completion ranges using apply_chat_template
+        completion_ranges = _get_completion_ranges(messages, auto_tokenizer, assistant_role)
+    else:
+        raise ValueError(f"AutoTokenizer not found for tokenizer_path: {tokenizer_path}")
     
-    return all_tokens, all_labels
+    # Create labels with non-assistant tokens masked
+    labels = _mask_ranges(tokens, completion_ranges)
+    
+    return tokens, labels
 
 
 # Add your dataset here - more information at docs/datasets.md
@@ -165,6 +259,7 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
         dp_rank: int = 0,
         dp_world_size: int = 1,
         infinite: bool = False,
+        tokenizer_path: str | None = None,  # Path for loading AutoTokenizer
     ) -> None:
         # Force lowercase for consistent comparison
         dataset_name = dataset_name.lower()
@@ -177,6 +272,7 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
         self.dataset_name = dataset_name
         self._data = split_dataset_by_node(ds, dp_rank, dp_world_size)
         self._tokenizer = tokenizer
+        self._tokenizer_path = tokenizer_path or ""  # Path for AutoTokenizer
         self.seq_len = seq_len
         self.infinite = infinite
         self._text_processor = text_processor
@@ -206,9 +302,12 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
                 is_chat_sft = self.dataset_name == "chat_jsonl" and "messages" in sample
                 
                 if is_chat_sft:
-                    # Use SFT processing with masked labels
+                    # Use SFT processing with masked labels (apply_chat_template style)
                     sample_tokens, sample_labels = process_chat_sft(
-                        sample, self._tokenizer, assistant_role="assistant"
+                        sample, 
+                        self._tokenizer, 
+                        tokenizer_path=self._tokenizer_path,
+                        assistant_role="assistant"
                     )
                     self._token_buffer.extend(sample_tokens)
                     self._label_buffer.extend(sample_labels)
@@ -289,6 +388,9 @@ def build_text_dataloader(
     dataset_path = job_config.training.dataset_path
     batch_size = job_config.training.local_batch_size
     seq_len = job_config.training.seq_len
+    
+    # Get tokenizer path for AutoTokenizer (apply_chat_template support)
+    tokenizer_path = job_config.model.tokenizer_path or job_config.model.hf_assets_path
 
     hf_ds = HuggingFaceTextDataset(
         dataset_name=dataset_name,
@@ -298,6 +400,7 @@ def build_text_dataloader(
         dp_rank=dp_rank,
         dp_world_size=dp_world_size,
         infinite=infinite,
+        tokenizer_path=tokenizer_path,
     )
 
     return ParallelAwareDataloader(
@@ -320,6 +423,9 @@ def build_text_validation_dataloader(
     dataset_path = job_config.validation.dataset_path
     batch_size = job_config.validation.local_batch_size
     seq_len = job_config.validation.seq_len
+    
+    # Get tokenizer path for AutoTokenizer (apply_chat_template support)
+    tokenizer_path = job_config.model.tokenizer_path or job_config.model.hf_assets_path
 
     hf_ds = HuggingFaceTextDataset(
         dataset_name=dataset_name,
@@ -329,6 +435,7 @@ def build_text_validation_dataloader(
         dp_rank=dp_rank,
         dp_world_size=dp_world_size,
         infinite=infinite,
+        tokenizer_path=tokenizer_path,
     )
 
     return ParallelAwareDataloader(
